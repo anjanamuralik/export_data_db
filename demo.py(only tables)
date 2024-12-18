@@ -1,0 +1,263 @@
+import cx_Oracle
+import logging
+from datetime import datetime
+import os
+import time
+
+class OracleMetadataExporter:
+    def __init__(self, host: str, port: str, service_name: str, username: str, password: str):
+        self.host = host
+        self.port = port
+        self.service_name = service_name
+        self.username = username
+        self.password = password
+        self.schemas = ['SYSTEM']
+        self.output_dir = 'metadata_export'
+        self.connection = None
+        
+    def connect(self):
+        """Establish database connection as SYSDBA"""
+        try:
+            dsn = cx_Oracle.makedsn(
+                self.host,
+                self.port,
+                service_name=self.service_name
+            )
+            self.connection = cx_Oracle.connect(
+                user=self.username,
+                password=self.password,
+                dsn=dsn,
+                mode=cx_Oracle.SYSDBA
+            )
+            logging.info(f"Successfully connected to Oracle database {self.service_name}")
+        except Exception as e:
+            logging.error(f"Failed to connect to database: {str(e)}")
+            raise
+
+    def setup_metadata_extraction(self):
+        """Setup DBMS_METADATA parameters"""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    BEGIN
+                        DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE);
+                        DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
+                        DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', TRUE);
+                        DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'PRETTY', TRUE);
+                    END;
+                """)
+            logging.info("DBMS_METADATA parameters set successfully")
+        except Exception as e:
+            logging.error(f"Failed to set DBMS_METADATA parameters: {str(e)}")
+            raise
+        
+    def get_table_count(self, schema):
+        """Get total number of tables in schema"""
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM all_tables WHERE owner = :schema",
+                schema=schema
+            )
+            return cursor.fetchone()[0]    
+
+    def export_metadata(self):
+        """Export metadata to text files"""
+        try:
+            print("Starting metadata export...")
+            self.connect()
+            print("Connected to database successfully")
+            
+            self.setup_metadata_extraction()
+            print("Metadata extraction parameters set")
+            
+            # Create output directory with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.output_dir = f"metadata_export_{timestamp}"
+            if not os.path.exists(self.output_dir):
+                os.makedirs(self.output_dir)
+            print(f"Created output directory: {self.output_dir}")
+            
+            # Export tables only for now
+            self.export_tables()
+            
+            print(f"\nMetadata export completed. Files are in the '{self.output_dir}' directory")
+            
+        except KeyboardInterrupt:
+            print("\nExport interrupted by user")
+            logging.warning("Export interrupted by user")
+        except Exception as e:
+            print(f"\nError during export: {str(e)}")
+            logging.error(f"Export failed: {str(e)}")
+            raise
+        finally:
+            if self.connection:
+                self.connection.close()
+                print("Database connection closed")
+
+    def export_tables(self):
+        """Export table metadata with progress tracking"""
+        print("\nStarting table export...")
+        
+        with open(f"{self.output_dir}/tables.txt", 'w') as f:
+            f.write("=== TABLE METADATA ===\n\n")
+            
+            for schema in self.schemas:
+                print(f"\nProcessing schema: {schema}")
+                total_tables = self.get_table_count(schema)
+                print(f"Total tables found: {total_tables}")
+                
+                f.write(f"\nSchema: {schema}\n")
+                f.write("-" * 50 + "\n")
+                
+                processed = 0
+                chunk_size = 10  # Process 10 tables at a time
+                
+                with self.connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT table_name
+                        FROM all_tables
+                        WHERE owner = :schema
+                        ORDER BY table_name
+                    """, schema=schema)
+                    
+                    tables = cursor.fetchall()
+                    
+                    for table_row in tables:
+                        table_name = table_row[0]
+                        processed += 1
+                        
+                        print(f"\rProcessing table {processed}/{total_tables}: {table_name}", end='', flush=True)
+                        
+                        try:
+                            # Get table details in separate query
+                            cursor.execute("""
+                                SELECT 
+                                    num_rows,
+                                    blocks,
+                                    last_analyzed
+                                FROM all_tables
+                                WHERE owner = :schema
+                                AND table_name = :table_name
+                            """, schema=schema, table_name=table_name)
+                            
+                            stats = cursor.fetchone()
+                            
+                            # Get DDL in separate query
+                            cursor.execute("""
+                                SELECT DBMS_METADATA.GET_DDL('TABLE', :table_name, :schema) 
+                                FROM dual
+                            """, table_name=table_name, schema=schema)
+                            
+                            ddl_row = cursor.fetchone()
+                            
+                            # Write the information
+                            f.write(f"\nTable: {table_name}\n")
+                            f.write(f"Rows: {stats[0] if stats[0] is not None else 'Not analyzed'}\n")
+                            f.write(f"Blocks: {stats[1] if stats[1] is not None else 'Not analyzed'}\n")
+                            f.write(f"Last Analyzed: {stats[2] if stats[2] is not None else 'Never'}\n")
+                            f.write("\nDDL:\n")
+                            
+                            if ddl_row and ddl_row[0]:
+                                ddl = ddl_row[0].read()
+                                f.write(ddl)
+                            else:
+                                f.write("DDL not available")
+                            
+                            f.write("\n" + "=" * 80 + "\n")
+                            f.flush()  # Ensure writing to file immediately
+                            
+                        except Exception as e:
+                            logging.error(f"Error processing table {table_name}: {str(e)}")
+                            f.write(f"\nError processing table {table_name}: {str(e)}\n")
+                            continue
+                        
+                        # Small delay between tables to prevent overwhelming the system
+                        time.sleep(0.1)
+                
+                print(f"\nCompleted processing schema {schema}")
+
+    def export_concurrent_programs(self):
+        """Export EBS concurrent program metadata"""
+        with open(f"{self.output_dir}/concurrent_programs.txt", 'w') as f:
+            f.write("=== CONCURRENT PROGRAMS ===\n\n")
+            
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        cp.concurrent_program_name,
+                        cpt.user_concurrent_program_name,
+                        e.executable_name,
+                        cp.execution_method_code,
+                        cp.argument_method_code
+                    FROM apps.fnd_concurrent_programs_vl cp
+                    JOIN apps.fnd_concurrent_programs_tl cpt 
+                        ON cp.concurrent_program_id = cpt.concurrent_program_id
+                    JOIN apps.fnd_executables e 
+                        ON cp.executable_id = e.executable_id
+                    WHERE cpt.language = 'US'
+                    ORDER BY cp.concurrent_program_name
+                """)
+                
+                for row in cursor:
+                    f.write(f"\nProgram Name: {row[0]}\n")
+                    f.write(f"Display Name: {row[1]}\n")
+                    f.write(f"Executable: {row[2]}\n")
+                    f.write(f"Execution Method: {row[3]}\n")
+                    f.write(f"Argument Method: {row[4]}\n")
+                    f.write("-" * 50 + "\n")
+
+    def export_performance_stats(self):
+        """Export performance-related statistics"""
+        with open(f"{self.output_dir}/performance_stats.txt", 'w') as f:
+            f.write("=== PERFORMANCE STATISTICS ===\n\n")
+            
+            # Table statistics
+            f.write("TABLE STATISTICS\n")
+            f.write("-" * 50 + "\n")
+            
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        owner,
+                        table_name,
+                        num_rows,
+                        blocks,
+                        empty_blocks,
+                        avg_row_len,
+                        last_analyzed
+                    FROM all_tab_statistics
+                    WHERE owner IN :schemas
+                    ORDER BY owner, table_name
+                """, schemas=tuple(self.schemas))
+                
+                for row in cursor:
+                    f.write(f"\nTable: {row[0]}.{row[1]}\n")
+                    f.write(f"Rows: {row[2]:,}\n")
+                    f.write(f"Blocks: {row[3]:,}\n")
+                    f.write(f"Empty Blocks: {row[4]:,}\n")
+                    f.write(f"Avg Row Length: {row[5]}\n")
+                    f.write(f"Last Analyzed: {row[6]}\n")
+                    f.write("-" * 30 + "\n")
+
+if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filename='metadata_export.log'
+    )
+    
+    params = {
+        'host': '192.168.1.50',
+        'port': '1531',
+        'service_name': 'TEST',
+        'username': 'sys',
+        'password': 'manager'
+    }
+    
+    try:
+        exporter = OracleMetadataExporter(**params)
+        exporter.export_metadata()
+    except Exception as e:
+        print(f"Export failed: {str(e)}")
+        logging.error(f"Export failed: {str(e)}")
